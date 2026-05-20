@@ -26,20 +26,20 @@ MODEL_PATH = Path(__file__).resolve().parent.parent / "runs" / "detect_workpiece
 CLASS_NAMES = ["gear", "bearing", "washer", "bolt", "block"]
 
 HSV_RANGES = {
-    "gear":    (np.array([0, 80, 80]),   np.array([12, 255, 255]),
-                np.array([170, 80, 80]), np.array([180, 255, 255])),
-    "bearing": (np.array([105, 80, 80]), np.array([135, 255, 255]),
+    "gear":    (np.array([0, 20, 60]),   np.array([15, 255, 255]),
+                np.array([170, 20, 60]), np.array([180, 255, 255])),
+    "bearing": (np.array([100, 20, 60]), np.array([135, 255, 255]),
                 None, None),
-    "washer":  (np.array([45, 80, 80]),  np.array([80, 255, 255]),
+    "washer":  (np.array([40, 20, 60]),  np.array([85, 255, 255]),
                 None, None),
-    "bolt":    (np.array([0, 0, 60]),    np.array([180, 30, 200]),
+    "bolt":    (np.array([0, 0, 30]),    np.array([180, 50, 200]),
                 None, None),
-    "block":   (np.array([15, 80, 80]),  np.array([35, 255, 255]),
+    "block":   (np.array([10, 20, 60]),  np.array([40, 255, 255]),
                 None, None),
 }
 
-MIN_CONTOUR_AREA = 30
-MAX_CONTOUR_AREA = 5000
+MIN_CONTOUR_AREA = 15
+MAX_CONTOUR_AREA = 8000
 
 _model = None
 
@@ -109,14 +109,16 @@ def _refine_with_hsv(rgb_img, bbox_xyxy, class_name):
         contour=best)
 
 
-def detect_objects(rgb_img, debug=False, conf_threshold=0.05):
+def detect_objects(rgb_img, debug=False, conf_threshold=0.1,
+                   use_hsv_refine=True):
     """
-    YOLOv8 粗定位 + HSV 精修轮廓。
+    YOLOv8 检测 + 可选 HSV 精修轮廓。
 
     参数:
-        rgb_img:       (H, W, 3) uint8 RGB
-        debug:         是否返回调试 mask
-        conf_threshold: YOLO 置信度阈值
+        rgb_img:        (H, W, 3) uint8 RGB
+        debug:          是否返回调试 mask
+        conf_threshold: YOLO 置信度阈值 (0.25 为合理默认值)
+        use_hsv_refine: 是否启用 HSV 后处理精修轮廓
 
     返回:
         objects:       DetectedObject 列表
@@ -135,23 +137,82 @@ def detect_objects(rgb_img, debug=False, conf_threshold=0.05):
     if boxes is None or len(boxes) == 0:
         return (objects, debug_masks) if debug else objects
 
+    # Build raw detections list with confidence scores
+    raw_detections = []
     for box in boxes:
         cls_id = int(box.cls[0])
+        conf = float(box.conf[0])
         class_name = CLASS_NAMES[cls_id]
         bbox = box.xyxy[0].cpu().numpy()
 
-        obj = _refine_with_hsv(rgb_img, bbox, class_name)
+        if use_hsv_refine:
+            obj = _refine_with_hsv(rgb_img, bbox, class_name)
+        else:
+            obj = _bbox_to_object(rgb_img, bbox, class_name)
+
         if obj is not None:
-            objects.append(obj)
+            raw_detections.append((conf, obj, bbox, class_name))
 
-        if debug and obj is not None:
-            mask = np.zeros(rgb_img.shape[:2], dtype=np.uint8)
-            x1, y1, x2, y2 = [int(v) for v in bbox]
-            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
-            debug_masks[class_name] = mask if class_name not in debug_masks else \
-                cv2.bitwise_or(debug_masks[class_name], mask)
+    # Sort by confidence descending
+    raw_detections.sort(key=lambda x: x[0], reverse=True)
 
+    # Class-aware NMS: suppress overlapping detections of the same class
+    kept = []
+    for conf, obj, bbox, class_name in raw_detections:
+        x1, y1, x2, y2 = bbox
+        suppressed = False
+        for _, kept_obj in kept:
+            if kept_obj.class_name != class_name:
+                continue
+            # Compute IoU between this detection and the kept detection
+            kx1 = kept_obj.box_points[0, 0]
+            ky1 = kept_obj.box_points[0, 1]
+            kx2 = kept_obj.box_points[2, 0]
+            ky2 = kept_obj.box_points[2, 1]
+            inter_x1 = max(x1, kx1)
+            inter_y1 = max(y1, ky1)
+            inter_x2 = min(x2, kx2)
+            inter_y2 = min(y2, ky2)
+            if inter_x1 < inter_x2 and inter_y1 < inter_y2:
+                inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+                area_a = (x2 - x1) * (y2 - y1)
+                area_b = (kx2 - kx1) * (ky2 - ky1)
+                iou = inter_area / (area_a + area_b - inter_area + 1e-8)
+                if iou > 0.3:
+                    suppressed = True
+                    break
+        if not suppressed:
+            kept.append((conf, obj))
+            if debug:
+                mask = np.zeros(rgb_img.shape[:2], dtype=np.uint8)
+                ix1, iy1, ix2, iy2 = [int(v) for v in bbox]
+                cv2.rectangle(mask, (ix1, iy1), (ix2, iy2), 255, -1)
+                debug_masks[class_name] = mask if class_name not in debug_masks else \
+                    cv2.bitwise_or(debug_masks[class_name], mask)
+
+    objects = [obj for _, obj in kept]
     return (objects, debug_masks) if debug else objects
+
+
+def _bbox_to_object(rgb_img, bbox, class_name):
+    """从 YOLO 包围盒直接构造 DetectedObject（无 HSV 精修）。"""
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    w = x2 - x1
+    h = y2 - y1
+    cx = x1 + w / 2
+    cy = y1 + h / 2
+    box_points = np.array([
+        [x1, y1], [x2, y1], [x2, y2], [x1, y2]
+    ], dtype=np.float32)
+    # Create a simple rectangular contour from box points (for compatibility with draw utils)
+    contour = box_points.reshape(-1, 1, 2).astype(np.int32)
+    return DetectedObject(
+        class_name=class_name,
+        cx=cx, cy=cy,
+        angle=0.0,
+        w=w, h=h,
+        box_points=box_points,
+        contour=contour)
 
 
 def detect_from_bgr(bgr_img, debug=False):

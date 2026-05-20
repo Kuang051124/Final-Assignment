@@ -13,7 +13,8 @@ from collections import deque
 
 from scene import build_scene, get_ground_truth
 from camera import SimCamera
-from detection_hsv import detect_objects
+# from detection_hsv import detect_objects
+from detection_yolo import detect_objects  # 改为：YOLO
 from depth_pose import restore_all_objects, evaluate_accuracy
 from grasp_plan import (
     plan_pick_and_place, solve_ik, execute_waypoints,

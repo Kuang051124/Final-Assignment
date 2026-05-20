@@ -64,10 +64,11 @@ class SimCamera:
         pm = self.get_proj_matrix()
 
         # PyBullet 渲染
+        # ER_TINY_RENDERER works in both DIRECT and GUI mode with correct colors
         img = p.getCameraImage(
             width=self.width, height=self.height,
             viewMatrix=vm, projectionMatrix=pm,
-            renderer=p.ER_BULLET_HARDWARE_OPENGL)
+            renderer=p.ER_TINY_RENDERER)
 
         # 提取 RGB：img[2] 是 RGBA (H*W*4) uint8
         rgba = np.reshape(img[2], (self.height, self.width, 4))
